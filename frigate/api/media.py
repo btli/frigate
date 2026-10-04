@@ -341,7 +341,7 @@ async def get_snapshot_from_recording(
     recording: Recordings | None = None
 
     try:
-        recording = (
+        recording = await asyncio.to_thread(
             Recordings.select(
                 Recordings.path,
                 Recordings.start_time,
@@ -353,14 +353,14 @@ async def get_snapshot_from_recording(
             .where(Recordings.camera == camera_name)
             .order_by(Recordings.stream_type.asc(), Recordings.start_time.desc())
             .limit(1)
-            .get()
+            .get
         )
     except DoesNotExist:
         # try again with a rounded frame time as it may be between
         # the rounded segment start time
         frame_time = math.ceil(frame_time)
         try:
-            recording = (
+            recording = await asyncio.to_thread(
                 Recordings.select(
                     Recordings.path,
                     Recordings.start_time,
@@ -372,7 +372,7 @@ async def get_snapshot_from_recording(
                 .where(Recordings.camera == camera_name)
                 .order_by(Recordings.stream_type.asc(), Recordings.start_time.desc())
                 .limit(1)
-                .get()
+                .get
             )
         except DoesNotExist:
             pass
@@ -383,8 +383,13 @@ async def get_snapshot_from_recording(
         mime_type = "png" if format == "png" else "jpeg"
         config: FrigateConfig = request.app.frigate_config
 
-        image_data = get_image_from_recording(
-            config.ffmpeg, recording.path, time_in_segment, codec, height
+        image_data = await asyncio.to_thread(
+            get_image_from_recording,
+            config.ffmpeg,
+            recording.path,
+            time_in_segment,
+            codec,
+            height,
         )
 
         if not image_data:
@@ -436,10 +441,14 @@ async def submit_recording_snapshot_to_plus(
 
     try:
         config: FrigateConfig = request.app.frigate_config
-        recording: Recordings = recording_query.get()
+        recording: Recordings = await asyncio.to_thread(recording_query.get)
         time_in_segment = frame_time - recording.start_time
-        image_data = get_image_from_recording(
-            config.ffmpeg, recording.path, time_in_segment, "png"
+        image_data = await asyncio.to_thread(
+            get_image_from_recording,
+            config.ffmpeg,
+            recording.path,
+            time_in_segment,
+            "png",
         )
 
         if not image_data:
