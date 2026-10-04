@@ -33,6 +33,16 @@ class RangeCase:
 
 REQUEST_START = 1000
 REQUEST_END = 1100
+SNAPSHOT_TEST_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300ffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffdb004301ffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffc000110800010001030122000211"
+    "01031101ffc4001500010100000000000000000000000000000003ffc400141001000000000000"
+    "00000000000000000000ffc40014010100000000000000000000000000000000ffc40014110100"
+    "000000000000000000000000000000ffda000c03010002110311003f009800ffd9"
+)
 RANGE_CASES = (
     RangeCase("before", -MAX_SEGMENT_DURATION + 1, -1, False),
     RangeCase("meets_start", -10, 0, True),
@@ -640,13 +650,14 @@ class TestHttpMedia(BaseTestHttp):
         ).execute()
 
     def test_recording_snapshot_does_not_block_event_loop(self):
+        """Keeps the event loop responsive during blocking image extraction."""
         self._insert_recording("snapshot", 1000, 1010)
         started = threading.Event()
 
         def slow_image(*args):
             started.set()
             time.sleep(1)
-            return b"jpeg"
+            return SNAPSHOT_TEST_JPEG
 
         with (
             AuthTestClient(self.app) as client,
@@ -666,18 +677,23 @@ class TestHttpMedia(BaseTestHttp):
                 self.assertEqual(snapshot.result().status_code, 200)
 
     def test_recording_snapshot_hit_returns_image(self):
+        """Returns the image for a recording snapshot hit."""
         self._insert_recording("snapshot", 1000, 1010)
         with (
             AuthTestClient(self.app) as client,
-            patch("frigate.api.media.get_image_from_recording", return_value=b"jpeg"),
+            patch(
+                "frigate.api.media.get_image_from_recording",
+                return_value=SNAPSHOT_TEST_JPEG,
+            ),
         ):
             response = client.get("/front_door/recordings/1005/snapshot.jpg")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["Content-Type"], "image/jpeg")
-        self.assertEqual(response.content, b"jpeg")
+        self.assertEqual(response.content, SNAPSHOT_TEST_JPEG)
 
     def test_recording_snapshot_misses_return_404(self):
+        """Returns 404 when both requested snapshot times miss recordings."""
         self._insert_recording("snapshot", 1000, 1010)
         with AuthTestClient(self.app) as client:
             absent = client.get("/front_door/recordings/2000/snapshot.jpg")
@@ -687,6 +703,7 @@ class TestHttpMedia(BaseTestHttp):
         self.assertEqual(rounded_miss.status_code, 404)
 
     def test_plus_snapshot_miss_returns_404_without_image_lookup(self):
+        """Returns 404 for a Plus miss without extracting an image."""
         with (
             AuthTestClient(self.app) as client,
             patch("frigate.api.media.get_image_from_recording") as image,
