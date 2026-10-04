@@ -1,6 +1,10 @@
 """Unit tests for recordings/media API endpoints."""
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytz
 from fastapi import Request
@@ -8,6 +12,17 @@ from fastapi import Request
 from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user
 from frigate.models import Recordings
 from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
+
+SNAPSHOT_TEST_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300ffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffdb004301ffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffc000110800010001030122000211"
+    "01031101ffc4001500010100000000000000000000000000000003ffc400141001000000000000"
+    "00000000000000000000ffc40014010100000000000000000000000000000000ffc40014110100"
+    "000000000000000000000000000000ffda000c03010002110311003f009800ffd9"
+)
 
 
 class TestHttpMedia(BaseTestHttp):
@@ -527,3 +542,91 @@ class TestHttpMedia(BaseTestHttp):
 
             assert response.status_code == 200
             assert response.json() == [{"start_time": 1010, "end_time": 1030}]
+
+    def test_recording_snapshot_does_not_block_event_loop(self):
+        """Keeps the event loop responsive during blocking image extraction."""
+        Recordings.insert(
+            id="snapshot",
+            path="/media/recordings/snapshot.mp4",
+            camera="front_door",
+            start_time=1000,
+            end_time=1010,
+            duration=10,
+            motion=0,
+        ).execute()
+        started = threading.Event()
+
+        def slow_image(*args):
+            started.set()
+            time.sleep(1)
+            return SNAPSHOT_TEST_JPEG
+
+        with (
+            AuthTestClient(self.app) as client,
+            patch("frigate.api.media.get_image_from_recording", slow_image),
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                snapshot = executor.submit(
+                    client.get, "/front_door/recordings/1005/snapshot.jpg"
+                )
+                self.assertTrue(started.wait(timeout=2))
+                started_at = time.monotonic()
+                version = client.get("/version")
+                elapsed = time.monotonic() - started_at
+
+                self.assertEqual(version.status_code, 200)
+                self.assertLess(elapsed, 0.5)
+                self.assertEqual(snapshot.result().status_code, 200)
+
+    def test_recording_snapshot_hit_returns_image(self):
+        """Returns the image for a recording snapshot hit."""
+        Recordings.insert(
+            id="snapshot",
+            path="/media/recordings/snapshot.mp4",
+            camera="front_door",
+            start_time=1000,
+            end_time=1010,
+            duration=10,
+            motion=0,
+        ).execute()
+        with (
+            AuthTestClient(self.app) as client,
+            patch(
+                "frigate.api.media.get_image_from_recording",
+                return_value=SNAPSHOT_TEST_JPEG,
+            ),
+        ):
+            response = client.get("/front_door/recordings/1005/snapshot.jpg")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+        self.assertEqual(response.content, SNAPSHOT_TEST_JPEG)
+
+    def test_recording_snapshot_misses_return_404(self):
+        """Returns 404 when both requested snapshot times miss recordings."""
+        Recordings.insert(
+            id="snapshot",
+            path="/media/recordings/snapshot.mp4",
+            camera="front_door",
+            start_time=1000,
+            end_time=1010,
+            duration=10,
+            motion=0,
+        ).execute()
+        with AuthTestClient(self.app) as client:
+            absent = client.get("/front_door/recordings/2000/snapshot.jpg")
+            rounded_miss = client.get("/front_door/recordings/1010.5/snapshot.jpg")
+
+        self.assertEqual(absent.status_code, 404)
+        self.assertEqual(rounded_miss.status_code, 404)
+
+    def test_plus_snapshot_miss_returns_404_without_image_lookup(self):
+        """Returns 404 for a Plus miss without extracting an image."""
+        with (
+            AuthTestClient(self.app) as client,
+            patch("frigate.api.media.get_image_from_recording") as image,
+        ):
+            response = client.post("/front_door/plus/1005")
+
+        self.assertEqual(response.status_code, 404)
+        image.assert_not_called()
