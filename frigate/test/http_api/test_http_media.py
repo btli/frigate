@@ -8,6 +8,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from fastapi import Request
+from peewee import ModelSelect
 
 from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user
 from frigate.const import MAX_SEGMENT_DURATION
@@ -2064,6 +2065,57 @@ class TestHttpMedia(BaseTestHttp):
         self.assertEqual(response.headers["Content-Type"], "image/jpeg")
         self.assertEqual(response.content, b"jpeg")
 
+    def test_snapshot_database_lookup_does_not_block_event_loop(self):
+        """Version requests complete while each snapshot lookup is waiting."""
+        self._insert_recording("snapshot", 1000, 1010)
+        cases = (
+            ("GET", "/front_door/recordings/1005/snapshot.jpg", 1, 5),
+            ("GET", "/front_door/recordings/999.5/snapshot.jpg", 2, 0),
+            ("POST", "/front_door/plus/1005", 1, 5),
+        )
+        original_get = ModelSelect.get
+
+        for method, path, delayed_call, offset in cases:
+            with self.subTest(path=path):
+                started = threading.Event()
+                release = threading.Event()
+                finished = threading.Event()
+                calls = 0
+
+                def slow_get(query, *args, **kwargs):
+                    nonlocal calls
+                    if query.model is Recordings:
+                        calls += 1
+                        if calls == delayed_call:
+                            started.set()
+                            release.wait(timeout=5)
+                            finished.set()
+                    return original_get(query, *args, **kwargs)
+
+                with (
+                    AuthTestClient(self.app) as client,
+                    patch.object(ModelSelect, "get", slow_get),
+                    patch(
+                        "frigate.api.media.get_image_from_recording",
+                        return_value=b"image",
+                    ) as image,
+                    patch("frigate.api.media.cv2.imdecode", return_value="frame"),
+                    patch.object(self.app.frigate_config.plus_api, "upload_image"),
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
+                    snapshot = executor.submit(client.request, method, path)
+                    try:
+                        self.assertTrue(started.wait(timeout=2))
+                        version = client.get("/version")
+                        self.assertEqual(version.status_code, 200)
+                        self.assertFalse(finished.is_set())
+                    finally:
+                        release.set()
+
+                    self.assertEqual(snapshot.result(timeout=2).status_code, 200)
+                    self.assertEqual(calls, delayed_call)
+                    self.assertEqual(image.call_args.args[2], offset)
+
     def test_recording_snapshot_misses_return_404(self):
         self._insert_recording("snapshot", 1000, 1010)
 
@@ -2073,6 +2125,29 @@ class TestHttpMedia(BaseTestHttp):
 
         self.assertEqual(absent.status_code, 404)
         self.assertEqual(rounded_miss.status_code, 404)
+
+    def test_snapshot_lookup_prefers_main_stream(self):
+        """Offloading preserves main-stream priority over a newer substream."""
+        self._insert_recording("main", 1000, 1010)
+        self._insert_recording("sub", 1001, 1011, stream_type="sub")
+        with (
+            AuthTestClient(self.app) as client,
+            patch(
+                "frigate.api.media.get_image_from_recording", return_value=b"image"
+            ) as image,
+            patch("frigate.api.media.cv2.imdecode", return_value="frame"),
+            patch.object(self.app.frigate_config.plus_api, "upload_image"),
+        ):
+            for method, path in (
+                ("GET", "/front_door/recordings/1005/snapshot.jpg"),
+                ("POST", "/front_door/plus/1005"),
+            ):
+                with self.subTest(method=method):
+                    response = client.request(method, path)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(
+                        image.call_args.args[1:3], ("/media/recordings/main.mp4", 5)
+                    )
 
     def test_plus_snapshot_miss_returns_404_without_image_lookup(self):
         with (
